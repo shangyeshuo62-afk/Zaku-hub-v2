@@ -1,0 +1,716 @@
+-- ============================================================
+-- Zaku Hub - Obsidian Library 修正版
+-- プレイヤー選択をKickと同じ場所に配置 + 機能安定化
+-- ============================================================
+
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/main/Library.lua"))()
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local LocalPlayer = Players.LocalPlayer
+local CoreGui = game:GetService("CoreGui")
+
+-- 通知用
+local StarterGui = game:GetService("StarterGui")
+local function Notify(title, text, duration)
+    StarterGui:SetCore("SendNotification", {
+        Title = title,
+        Text = text,
+        Duration = duration or 3
+    })
+end
+
+-- GrabEvents
+local GrabEvents = ReplicatedStorage:FindFirstChild("GrabEvents")
+local CreateGrabLine = GrabEvents and GrabEvents:FindFirstChild("CreateGrabLine")
+local DestroyGrabLine = GrabEvents and GrabEvents:FindFirstChild("DestroyGrabLine")
+local SetNetworkOwner = GrabEvents and GrabEvents:FindFirstChild("SetNetworkOwner")
+
+-- 変数
+local Config = {
+    isActive = false,
+    allActive = false,
+    distance = 25,
+    lagRunning = false,
+    chatSpamRunning = false,
+    espEnabled = true,
+    friendProtect = true,
+    antiLogger = false,
+    antiLagEnabled = false,
+    realisticMapEnabled = false,
+    isNightMode = false,
+    antiRagdollEnabled = true
+}
+
+local selectedPlayerObj = nil
+local friendList = {}
+local chatMessages = {
+    "ゆずぴー最強ゆずぴー最強ゆずぴー最強",
+    "美味しいコミュニティに入ろう",
+    "みんなもゆずぴーを崇めよう"
+}
+local chatIndex = 1
+local waypoints = {}
+local selectedWaypointIndex = nil
+local espBoxes = {}
+local loggerKnownRemotes = {}
+local hiddenAntiLagParts = {}
+local originalLighting = {}
+local firefliesFolder = nil
+
+-- フレンドリスト
+local function updateFriendList()
+    local success, result = pcall(function()
+        return Players:GetFriendsAsync(LocalPlayer.UserId)
+    end)
+    if success and result then
+        friendList = {}
+        while true do
+            local page = result:GetCurrentPage()
+            for _, item in ipairs(page) do
+                friendList[item.Id] = item.Username
+            end
+            if result.IsFinished then break end
+            result:AdvanceToNextPageAsync()
+        end
+    end
+end
+updateFriendList()
+
+local function isFriend(player)
+    if not Config.friendProtect then return false end
+    return friendList[player.UserId] ~= nil
+end
+
+-- ============================================================
+-- コア機能（安定化）
+-- ============================================================
+local function startLagSpam()
+    if Config.lagRunning then return end
+    Config.lagRunning = true
+    task.spawn(function()
+        while Config.lagRunning do
+            local spawnLocation = Workspace:FindFirstChild("SpawnLocation")
+                or Workspace:FindFirstChild("Spawn")
+                or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"))
+            if spawnLocation and CreateGrabLine then
+                pcall(function()
+                    CreateGrabLine:FireServer(spawnLocation, CFrame.new(math.random(-1e9, 1e9), 0, math.random(-1e9, 1e9)))
+                end)
+            end
+            task.wait(0.001)
+        end
+    end)
+end
+
+local function stopLagSpam()
+    Config.lagRunning = false
+end
+
+local function teleportToTarget(targetPlayer, myRoot)
+    if not targetPlayer or not targetPlayer.Character then return end
+    local targetRoot = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not targetRoot or not myRoot then return end
+    local savedCF = myRoot.CFrame
+    myRoot.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 2)
+    for i = 1, 12 do
+        if SetNetworkOwner then
+            pcall(function() SetNetworkOwner:FireServer(targetRoot, targetRoot.CFrame) end)
+        end
+        task.wait()
+    end
+    myRoot.CFrame = savedCF
+end
+
+local function createKickEffect(targetPlayer)
+    if not targetPlayer or not targetPlayer.Character then return end
+    local tRoot = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not tRoot then return end
+
+    local old = tRoot:FindFirstChild("ZakuKickEffect")
+    if old then old:Destroy() end
+
+    local hole = Instance.new("Part")
+    hole.Name = "ZakuKickEffect"
+    hole.Shape = Enum.PartType.Ball
+    hole.Size = Vector3.new(1, 1, 1)
+    hole.Color = Color3.new(0, 0, 0)
+    hole.Material = Enum.Material.Neon
+    hole.Anchored = true
+    hole.CanCollide = false
+    hole.CFrame = tRoot.CFrame
+    hole.Parent = Workspace
+
+    local emitter = Instance.new("ParticleEmitter")
+    emitter.Texture = "rbxassetid://243660364"
+    emitter.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(100, 0, 150)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 0, 0))
+    })
+    emitter.Size = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 2),
+        NumberSequenceKeypoint.new(1, 0)
+    })
+    emitter.Transparency = NumberSequence.new(0.3)
+    emitter.Lifetime = NumberRange.new(0.5, 1)
+    emitter.Rate = 180
+    emitter.Speed = NumberRange.new(12)
+    emitter.SpreadAngle = Vector2.new(180, 180)
+    emitter.Parent = hole
+
+    task.delay(1.2, function()
+        if hole then hole:Destroy() end
+    end)
+end
+
+local function kickTarget(targetPlayer, myRoot)
+    if not targetPlayer or not targetPlayer.Character then return end
+    if isFriend(targetPlayer) then return end
+
+    local tRoot = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local tHum = targetPlayer.Character:FindFirstChild("Humanoid")
+    if not tRoot or not tHum or tHum.Health <= 0 then return end
+
+    local dist = (myRoot.Position - tRoot.Position).Magnitude
+    if dist > Config.distance then
+        teleportToTarget(targetPlayer, myRoot)
+    end
+
+    if SetNetworkOwner then
+        pcall(function() SetNetworkOwner:FireServer(tRoot, tRoot.CFrame) end)
+    end
+    if DestroyGrabLine then
+        pcall(function() DestroyGrabLine:FireServer(tRoot) end)
+    end
+
+    tRoot.AssemblyLinearVelocity = Vector3.zero
+    tRoot.AssemblyAngularVelocity = Vector3.zero
+
+    local bp = tRoot:FindFirstChild("ControlBP") or Instance.new("BodyPosition")
+    bp.Name = "ControlBP"
+    bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bp.P = 900000
+    bp.D = 2000
+    bp.Parent = tRoot
+    bp.Position = myRoot.Position + Vector3.new(0, 18, 0)
+
+    createKickEffect(targetPlayer)
+end
+
+-- Anti-Ragdoll
+local function stiffenJoints(char)
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("Motor6D") then
+            d.Enabled = true
+        elseif d:IsA("BallSocketConstraint") or d:IsA("HingeConstraint") then
+            d.Enabled = false
+        end
+    end
+end
+
+local function setupCharacter(char)
+    local humanoid = char:WaitForChild("Humanoid", 5)
+    if not humanoid then return end
+
+    humanoid.BreakJointsOnDeath = false
+    humanoid.RequiresNeck = false
+    humanoid.PlatformStand = false
+
+    humanoid.StateChanged:Connect(function(_, newState)
+        if not Config.antiRagdollEnabled then return end
+        if newState == Enum.HumanoidStateType.Ragdoll or newState == Enum.HumanoidStateType.Physics then
+            humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+    end)
+
+    if Config.antiRagdollEnabled then
+        stiffenJoints(char)
+    end
+end
+
+if LocalPlayer.Character then setupCharacter(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(setupCharacter)
+
+-- Anti-Lag
+local function toggleAntiLag(enable)
+    if enable then
+        for _, obj in pairs(Workspace:GetDescendants()) do
+            if obj:IsA("ParticleEmitter") or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") or obj:IsA("Trail") then
+                if not hiddenAntiLagParts[obj] then
+                    hiddenAntiLagParts[obj] = obj.Enabled
+                    obj.Enabled = false
+                end
+            elseif obj:IsA("BasePart") and obj.Material == Enum.Material.Neon then
+                if not hiddenAntiLagParts[obj] then
+                    hiddenAntiLagParts[obj] = obj.Material
+                    obj.Material = Enum.Material.SmoothPlastic
+                end
+            end
+        end
+        Notify("Anti-Lag", "有効化")
+    else
+        for obj, state in pairs(hiddenAntiLagParts) do
+            pcall(function()
+                if typeof(state) == "boolean" then
+                    obj.Enabled = state
+                else
+                    obj.Material = state
+                end
+            end)
+        end
+        hiddenAntiLagParts = {}
+        Notify("Anti-Lag", "無効化")
+    end
+end
+
+-- ホタル
+local function createFireflies()
+    if firefliesFolder then return end
+    firefliesFolder = Instance.new("Folder")
+    firefliesFolder.Name = "ZakuFireflies"
+    firefliesFolder.Parent = Workspace
+
+    for i = 1, 25 do
+        local part = Instance.new("Part")
+        part.Size = Vector3.new(0.2, 0.2, 0.2)
+        part.Shape = Enum.PartType.Ball
+        part.Color = Color3.fromRGB(200, 255, 0)
+        part.Material = Enum.Material.Neon
+        part.Anchored = true
+        part.CanCollide = false
+        part.Parent = firefliesFolder
+
+        local light = Instance.new("PointLight")
+        light.Color = Color3.fromRGB(200, 255, 0)
+        light.Range = 7
+        light.Brightness = 1
+        light.Parent = part
+
+        task.spawn(function()
+            while part and part.Parent do
+                local pos = Vector3.new(math.random(-90, 90), math.random(4, 25), math.random(-90, 90))
+                part.CFrame = part.CFrame:Lerp(CFrame.new(pos), 0.06)
+                task.wait(0.12)
+            end
+        end)
+    end
+end
+
+local function removeFireflies()
+    if firefliesFolder then
+        firefliesFolder:Destroy()
+        firefliesFolder = nil
+    end
+end
+
+-- Realistic Map
+local function toggleRealisticMap(enable, isNight)
+    if enable then
+        originalLighting = {
+            Ambient = Lighting.Ambient,
+            OutdoorAmbient = Lighting.OutdoorAmbient,
+            Brightness = Lighting.Brightness,
+            ClockTime = Lighting.ClockTime,
+            FogEnd = Lighting.FogEnd,
+            FogStart = Lighting.FogStart,
+            FogColor = Lighting.FogColor,
+        }
+        pcall(function() Lighting.Technology = Enum.Technology.Future end)
+
+        if isNight then
+            Lighting.Ambient = Color3.fromRGB(70, 70, 90)
+            Lighting.OutdoorAmbient = Color3.fromRGB(120, 120, 150)
+            Lighting.Brightness = 2
+            Lighting.ClockTime = 0
+            Lighting.FogEnd = 800
+            Lighting.FogStart = 100
+            Lighting.FogColor = Color3.fromRGB(30, 30, 50)
+            createFireflies()
+        else
+            removeFireflies()
+            Lighting.Ambient = Color3.fromRGB(40, 40, 40)
+            Lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
+            Lighting.Brightness = 2.5
+            Lighting.ClockTime = 14
+            Lighting.FogEnd = 1000
+            Lighting.FogStart = 100
+            Lighting.FogColor = Color3.fromRGB(200, 200, 210)
+        end
+    else
+        removeFireflies()
+        if originalLighting.Ambient then
+            for k, v in pairs(originalLighting) do
+                pcall(function() Lighting[k] = v end)
+            end
+        end
+    end
+end
+
+-- ESP（黄色）
+local function createESP(player)
+    if player == LocalPlayer or espBoxes[player.UserId] then return end
+
+    local box = Instance.new("BoxHandleAdornment")
+    box.Name = "ZakuESP_" .. player.Name
+    box.Size = Vector3.new(2, 5, 2)
+    box.Color3 = Color3.fromRGB(255, 255, 0)
+    box.Transparency = 0.4
+    box.AlwaysOnTop = true
+    box.ZIndex = 10
+    box.Parent = CoreGui
+
+    espBoxes[player.UserId] = box
+end
+
+for _, p in ipairs(Players:GetPlayers()) do createESP(p) end
+Players.PlayerAdded:Connect(createESP)
+Players.PlayerRemoving:Connect(function(p)
+    if espBoxes[p.UserId] then
+        espBoxes[p.UserId]:Destroy()
+        espBoxes[p.UserId] = nil
+    end
+end)
+
+RunService.RenderStepped:Connect(function()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local box = espBoxes[player.UserId]
+        if not box then continue end
+
+        local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        if Config.espEnabled and hrp then
+            box.Adornee = hrp
+            box.Visible = true
+            box.Color3 = isFriend(player) and Color3.fromRGB(0, 255, 100) or Color3.fromRGB(255, 255, 0)
+        else
+            box.Adornee = nil
+            box.Visible = false
+        end
+    end
+end)
+
+-- ============================================================
+-- Obsidian GUI（プレイヤー選択をKickと同じ場所に配置）
+-- ============================================================
+local Window = Library:CreateWindow({
+    Title = "Zaku Hub",
+    Footer = "修正版 - 機能安定化",
+    Center = true,
+    AutoShow = true,
+    Resizable = true,
+    ShowMobileButtons = true,
+    MobileButtonsSide = "Left",
+})
+
+local Tabs = {
+    Main = Window:AddTab("メイン"),
+    Visuals = Window:AddTab("ビジュアル"),
+    Misc = Window:AddTab("その他"),
+}
+
+-- ========== メインタブ（Kick + プレイヤー選択） ==========
+local CombatGroup = Tabs.Main:AddLeftGroupbox("Combat")
+
+-- プレイヤー選択をここに配置
+local PlayerDropdown = CombatGroup:AddDropdown("PlayerSelect", {
+    Text = "ターゲット選択",
+    Values = {},
+    Default = 1,
+    Multi = false,
+    Callback = function(Value)
+        if Value and Value ~= "" then
+            local plr = Players:FindFirstChild(Value)
+            if plr then
+                selectedPlayerObj = plr
+                Notify("ターゲット", plr.Name .. " を選択")
+            end
+        else
+            selectedPlayerObj = nil
+        end
+    end
+})
+
+local function refreshPlayerList()
+    local names = {}
+    for _, v in ipairs(Players:GetPlayers()) do
+        if v ~= LocalPlayer then
+            table.insert(names, v.Name)
+        end
+    end
+    table.sort(names)
+    PlayerDropdown:SetValues(names)
+end
+
+refreshPlayerList()
+Players.PlayerAdded:Connect(function()
+    task.wait(0.6)
+    refreshPlayerList()
+end)
+Players.PlayerRemoving:Connect(function(plr)
+    if selectedPlayerObj == plr then
+        selectedPlayerObj = nil
+        Notify("退出", plr.Name .. " が退出しました")
+    end
+    task.wait(0.3)
+    refreshPlayerList()
+end)
+
+CombatGroup:AddToggle("KickSpam", {
+    Text = "Kick Spam",
+    Default = false,
+    Callback = function(Value)
+        Config.isActive = Value
+        if Value then
+            if not selectedPlayerObj then
+                Notify("エラー", "先にターゲットを選択してください")
+                task.wait()
+                Library.Toggles.KickSpam:SetValue(false)
+                return
+            end
+            if isFriend(selectedPlayerObj) then
+                Notify("エラー", "フレンドは保護されています")
+                Library.Toggles.KickSpam:SetValue(false)
+                return
+            end
+            startLagSpam()
+            task.spawn(function()
+                while Config.isActive and selectedPlayerObj do
+                    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                    if myRoot then
+                        kickTarget(selectedPlayerObj, myRoot)
+                    end
+                    task.wait(0.001)
+                end
+            end)
+            Notify("Kick Spam", "ON")
+        else
+            stopLagSpam()
+            Notify("Kick Spam", "OFF")
+        end
+    end
+})
+
+CombatGroup:AddToggle("AllKick", {
+    Text = "All Kick",
+    Default = false,
+    Callback = function(Value)
+        Config.allActive = Value
+        if Value then
+            startLagSpam()
+            task.spawn(function()
+                while Config.allActive do
+                    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                    if myRoot then
+                        for _, v in ipairs(Players:GetPlayers()) do
+                            if v ~= LocalPlayer and not isFriend(v) then
+                                kickTarget(v, myRoot)
+                            end
+                        end
+                    end
+                    task.wait(0.001)
+                end
+            end)
+            Notify("All Kick", "ON")
+        else
+            stopLagSpam()
+            Notify("All Kick", "OFF")
+        end
+    end
+})
+
+CombatGroup:AddSlider("Distance", {
+    Text = "Kick距離",
+    Default = 25,
+    Min = 5,
+    Max = 80,
+    Rounding = 0,
+    Callback = function(Value)
+        Config.distance = Value
+    end
+})
+
+CombatGroup:AddButton("TP to Target", function()
+    if selectedPlayerObj and selectedPlayerObj.Character then
+        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local targetRoot = selectedPlayerObj.Character:FindFirstChild("HumanoidRootPart")
+        if myRoot and targetRoot then
+            myRoot.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 3)
+            Notify("TP", selectedPlayerObj.Name .. " の近くへ")
+        end
+    else
+        Notify("エラー", "ターゲットを選択してください")
+    end
+end)
+
+-- ========== ビジュアル ==========
+local VisualGroup = Tabs.Visuals:AddLeftGroupbox("ESP & Map")
+
+VisualGroup:AddToggle("ESP", {
+    Text = "ESP（黄色立方体）",
+    Default = true,
+    Callback = function(Value)
+        Config.espEnabled = Value
+        Notify("ESP", Value and "ON" or "OFF")
+    end
+})
+
+VisualGroup:AddToggle("FriendProtect", {
+    Text = "フレンド保護",
+    Default = true,
+    Callback = function(Value)
+        Config.friendProtect = Value
+    end
+})
+
+VisualGroup:AddToggle("RealMapDay", {
+    Text = "RealMap（昼）",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            Config.realisticMapEnabled = true
+            Config.isNightMode = false
+            toggleRealisticMap(true, false)
+            if Library.Toggles.RealMapNight then
+                Library.Toggles.RealMapNight:SetValue(false)
+            end
+            Notify("RealMap", "昼")
+        else
+            Config.realisticMapEnabled = false
+            toggleRealisticMap(false, false)
+        end
+    end
+})
+
+VisualGroup:AddToggle("RealMapNight", {
+    Text = "RealMap（夜）",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            Config.realisticMapEnabled = true
+            Config.isNightMode = true
+            toggleRealisticMap(true, true)
+            if Library.Toggles.RealMapDay then
+                Library.Toggles.RealMapDay:SetValue(false)
+            end
+            Notify("RealMap", "夜")
+        else
+            Config.realisticMapEnabled = false
+            toggleRealisticMap(false, true)
+            Config.isNightMode = false
+        end
+    end
+})
+
+-- ========== その他 ==========
+local MiscGroup = Tabs.Misc:AddLeftGroupbox("Misc")
+
+MiscGroup:AddToggle("ChatSpam", {
+    Text = "Chat Spam",
+    Default = false,
+    Callback = function(Value)
+        Config.chatSpamRunning = Value
+        if Value then
+            task.spawn(function()
+                while Config.chatSpamRunning do
+                    local msg = chatMessages[chatIndex]
+                    pcall(function()
+                        local TextChatService = game:GetService("TextChatService")
+                        if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+                            local channel = TextChatService.ChatInputBarConfiguration.TargetTextChannel
+                            if channel then channel:SendAsync(msg) end
+                        else
+                            local chatEvent = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+                            if chatEvent and chatEvent:FindFirstChild("SayMessageRequest") then
+                                chatEvent.SayMessageRequest:FireServer(msg, "All")
+                            end
+                        end
+                    end)
+                    chatIndex = chatIndex % #chatMessages + 1
+                    task.wait(2.2)
+                end
+            end)
+            Notify("Chat Spam", "ON")
+        else
+            Notify("Chat Spam", "OFF")
+        end
+    end
+})
+
+MiscGroup:AddToggle("AntiRagdoll", {
+    Text = "Anti-Ragdoll",
+    Default = true,
+    Callback = function(Value)
+        Config.antiRagdollEnabled = Value
+        if Value and LocalPlayer.Character then
+            stiffenJoints(LocalPlayer.Character)
+        end
+        Notify("Anti-Ragdoll", Value and "ON" or "OFF")
+    end
+})
+
+MiscGroup:AddToggle("AntiLag", {
+    Text = "Anti-Lag",
+    Default = false,
+    Callback = function(Value)
+        Config.antiLagEnabled = Value
+        toggleAntiLag(Value)
+    end
+})
+
+MiscGroup:AddToggle("AntiLogger", {
+    Text = "Anti-Logger",
+    Default = false,
+    Callback = function(Value)
+        Config.antiLogger = Value
+        if Value then
+            Notify("Anti-Logger", "スキャン開始")
+            task.spawn(function()
+                while Config.antiLogger do
+                    for _, v in pairs(game:GetDescendants()) do
+                        if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then
+                            local name = string.lower(v.Name)
+                            if string.find(name, "key") or string.find(name, "log") or string.find(name, "send") then
+                                if not loggerKnownRemotes[v] then
+                                    loggerKnownRemotes[v] = true
+                                    Notify("⚠ ロガー検知", v:GetFullName(), 5)
+                                end
+                            end
+                        end
+                    end
+                    task.wait(1.5)
+                end
+            end)
+        else
+            Notify("Anti-Logger", "停止")
+        end
+    end
+})
+
+local WPGroup = Tabs.Misc:AddRightGroupbox("Waypoint")
+
+WPGroup:AddButton("Save Waypoint", function()
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if root then
+        local name = "WP " .. (#waypoints + 1)
+        table.insert(waypoints, {name = name, cframe = root.CFrame})
+        selectedWaypointIndex = #waypoints
+        Notify("Waypoint", name .. " 保存")
+    end
+end)
+
+WPGroup:AddButton("Teleport WP", function()
+    if selectedWaypointIndex and waypoints[selectedWaypointIndex] then
+        local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if root then
+            root.CFrame = waypoints[selectedWaypointIndex].cframe
+            Notify("TP", waypoints[selectedWaypointIndex].name)
+        end
+    else
+        Notify("エラー", "ウェイポイントがありません")
+    end
+end)
+
+Notify("Zaku Hub", "修正版ロード完了！プレイヤー選択をメインに移動済み", 4)
